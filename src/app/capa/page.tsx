@@ -21,12 +21,13 @@ function firstParam(value: SearchParams[keyof SearchParams]): string | undefined
 export default async function CapaDashboardPage({
   searchParams,
 }: {
-  searchParams?: SearchParams;
+  searchParams?: Promise<SearchParams>;
 }) {
-  const status_id = firstParam(searchParams?.status_id);
-  const priority_id = firstParam(searchParams?.priority_id);
-  const department_id = firstParam(searchParams?.department_id);
-  const error = firstParam(searchParams?.error);
+  const resolved = (await searchParams) ?? {};
+  const status_id = firstParam(resolved.status_id);
+  const priority_id = firstParam(resolved.priority_id);
+  const department_id = firstParam(resolved.department_id);
+  const error = firstParam(resolved.error);
 
   const [statusOptions, priorityOptions, departmentOptions] = await Promise.all([
     getStatusOptions(),

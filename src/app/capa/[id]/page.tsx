@@ -129,13 +129,14 @@ export default async function CapaDetailPage({
   searchParams,
 }: {
   params: Promise<{ id: string }>;
-  searchParams?: { tab?: string | string[] };
+  searchParams?: Promise<{ tab?: string | string[] }>;
 }) {
   const firstParam = (value?: string | string[]) =>
     Array.isArray(value) ? value[0] : value;
 
   const { id } = await params;
-  const tab = firstParam(searchParams?.tab) ?? "actions";
+  const resolvedSearch = (await searchParams) ?? {};
+  const tab = firstParam(resolvedSearch.tab) ?? "actions";
   const { user: currentUser, roles: currentRoles } = await getCurrentUserWithRoles();
 
   const {

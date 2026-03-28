@@ -1,6 +1,9 @@
-import { createSupabaseServerClient } from "@/lib/supabase/server";
 import type { CapaRecord, CapaAction, CapaComment } from "@/domain/capa";
 import { cache } from "react";
+import { supabaseAdmin } from "@/lib/supabase/admin";
+
+import { createSupabaseServerClient } from "@/lib/supabase/server";
+
 
 export type SelectOption = {
   id: string;
@@ -22,63 +25,78 @@ export function getAllowedNextStatuses(currentStatusCode: string): string[] {
   return ACTION_STATUS_TRANSITIONS[normalized] ?? [];
 }
 
-async function getCurrentActor(
-  supabase: Awaited<ReturnType<typeof createSupabaseServerClient>>,
-): Promise<{ userId: string; roleCodes: string[]; organizationId: string | null } | null> {
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
-  if (!user) return null;
+async function getCurrentActor(): Promise<{
+  userId: number;
+  roleCodes: string[];
+  organizationId: string | null;
+} | null> {
+  const supabase = await createSupabaseServerClient();
 
-  const { data: actorUserRow, error: actorUserError } = await supabase
-    .from("core.users")
-    .select("organization_id")
-    .eq("id", user.id)
+  const { data: { user: authUser } } = await supabase.auth.getUser();
+  console.log("AUTH USER:", authUser);
+  if (!authUser) return null;
+
+  const { data: actorUser, error: actorUserError } = await supabase
+    .schema("core")
+    .from("users")
+    .select("id, organization_id")
+    .eq("auth_user_id", authUser.id)
     .maybeSingle();
+
+  console.log("ACTOR USER:", actorUser);
 
   if (actorUserError) {
     console.error("Failed to load actor organization", actorUserError.message);
+    return null;
   }
 
+  if (!actorUser) return null;
+
   const { data: roleRows, error } = await supabase
-    .from("core.user_roles")
-    .select(
-      `
-      core_roles:core.roles (
-        code
-      )
-    `,
-    )
-    .eq("user_id", user.id);
+    .schema("core")
+    .from("user_roles")
+    .select(`
+      user_id,
+      core_roles:roles(code)
+    `)
+    .eq("user_id", actorUser.id);
 
   if (error) {
     console.error("Failed to load actor roles", error.message);
+    console.log("RETURN ACTOR:", {
+      userId: actorUser?.id,
+      organizationId: actorUser?.organization_id,
+    });
     return {
-      userId: user.id,
+      userId: actorUser.id,
       roleCodes: [],
-      organizationId:
-        (actorUserRow as { organization_id?: string | null } | null)
-          ?.organization_id ?? null,
+      organizationId: actorUser.organization_id ?? null,
     };
   }
 
   const roleCodes =
-    (
-      (roleRows ?? []) as unknown as Array<{
-        core_roles: { code: string } | null;
-      }>
-    )
-      .map((row) => row.core_roles?.code)
-      .filter((code): code is string => Boolean(code))
-      .map((code) => code.toUpperCase()) ?? [];
+    (roleRows ?? [])
+      .map((row: any) => row.core_roles?.code)
+      .filter((code: string | undefined): code is string => Boolean(code))
+      .map((code: string) => code.toUpperCase());
 
+  console.log("RETURN ACTOR:", {
+    userId: actorUser?.id,
+    organizationId: actorUser?.organization_id,
+  });
   return {
-    userId: user.id,
+    userId: actorUser.id,
     roleCodes,
-    organizationId:
-      (actorUserRow as { organization_id?: string | null } | null)
-        ?.organization_id ?? null,
+    organizationId: actorUser.organization_id ?? null,
   };
+}
+
+function sameActorUserId(
+  dbValue: string | number | null | undefined,
+  actorId: number,
+): boolean {
+  if (dbValue == null) return false;
+  return String(dbValue) === String(actorId);
 }
 
 async function notifyUser(
@@ -93,14 +111,14 @@ async function notifyUser(
 ): Promise<void> {
   if (input.event_key) {
     const { data: existing } = await supabase
-      .from("core.notifications")
+      .schema("core").from("notifications")
       .select("id")
       .eq("event_key", input.event_key)
       .maybeSingle();
     if (existing) return;
   }
 
-  const { error } = await supabase.from("core.notifications").insert({
+  const { error } = await supabase.schema("core").from("notifications").insert({
     user_id: input.user_id,
     title: input.title,
     message: input.message,
@@ -136,11 +154,11 @@ function toSelectOption(row: Record<string, unknown>): SelectOption | null {
   return { id, label, code, is_final, sort_order };
 }
 
-async function fetchOptions(table: string): Promise<SelectOption[]> {
-  const supabase = await createSupabaseServerClient();
-  const { data, error } = await supabase.from(table).select("*");
+async function fetchOptions(schema: string, table: string): Promise<SelectOption[]> {
+  const supabase = supabaseAdmin;
+  const { data, error } = await supabase.schema(schema).from(table).select("*");
   if (error) {
-    console.error(`Failed to load options from ${table}`, error.message);
+    console.error(`Failed to load options from ${schema}.${table}`, error.message);
     return [];
   }
 
@@ -148,16 +166,18 @@ async function fetchOptions(table: string): Promise<SelectOption[]> {
   return rows.map(toSelectOption).filter((o): o is SelectOption => Boolean(o));
 }
 
-const fetchOptionsCached = cache(async (table: string): Promise<SelectOption[]> => {
-  return fetchOptions(table);
-});
+const fetchOptionsCached = cache(
+  async (schema: string, table: string): Promise<SelectOption[]> => {
+    return fetchOptions(schema, table);
+  },
+);
 
 export function getStatusOptions(): Promise<SelectOption[]> {
-  return fetchOptionsCached("ref.status_codes");
+  return fetchOptionsCached("ref", "status_codes");
 }
 
 export function getPriorityOptions(): Promise<SelectOption[]> {
-  return fetchOptionsCached("ref.priority_codes");
+  return fetchOptionsCached("ref", "priority_codes");
 }
 
 export function getDepartmentOptions(): Promise<SelectOption[]> {
@@ -165,18 +185,18 @@ export function getDepartmentOptions(): Promise<SelectOption[]> {
 }
 
 export function getCapaTypeOptions(): Promise<SelectOption[]> {
-  return fetchOptionsCached("ref.capa_types");
+  return fetchOptionsCached("ref", "capa_types");
 }
 
 export function getRootCauseMethodOptions(): Promise<SelectOption[]> {
-  return fetchOptionsCached("ref.root_cause_methods");
+  return fetchOptionsCached("ref", "root_cause_methods");
 }
 
 const getUserOptionsCached = cache(
   async (organizationId: string, limit: number): Promise<SelectOption[]> => {
-    const supabase = await createSupabaseServerClient();
+    const supabase = supabaseAdmin;
     const { data, error } = await supabase
-      .from("core.users")
+      .schema("core").from("users")
       .select("*")
       .eq("organization_id", organizationId)
       .order("email", { ascending: true })
@@ -210,7 +230,8 @@ const getDepartmentOptionsCached = cache(
   async (organizationId: string): Promise<SelectOption[]> => {
     const supabase = await createSupabaseServerClient();
     const { data, error } = await supabase
-      .from("core.departments")
+      .schema("core")
+      .from("departments")
       .select("*")
       .eq("organization_id", organizationId)
       .order("name", { ascending: true });
@@ -226,8 +247,8 @@ const getDepartmentOptionsCached = cache(
 );
 
 async function getDepartmentOptionsForCurrentOrganization(): Promise<SelectOption[]> {
-  const supabase = await createSupabaseServerClient();
-  const actor = await getCurrentActor(supabase);
+  const actor = await getCurrentActor();
+  console.log("ACTOR IN DEPARTMENT FUNC:", actor);
   if (!actor?.organizationId) {
     console.error("Missing organization context for department options");
     return [];
@@ -236,8 +257,7 @@ async function getDepartmentOptionsForCurrentOrganization(): Promise<SelectOptio
 }
 
 export async function getUserOptions(limit = 200): Promise<SelectOption[]> {
-  const supabase = await createSupabaseServerClient();
-  const actor = await getCurrentActor(supabase);
+  const actor = await getCurrentActor();
   if (!actor?.organizationId) {
     console.error("Missing organization context for user options");
     return [];
@@ -254,21 +274,16 @@ export async function listCapaRecordsFiltered(filters: {
   priority_id?: string;
   department_id?: string;
 }): Promise<CapaRecord[]> {
-  const supabase = await createSupabaseServerClient();
-  const actor = await getCurrentActor(supabase);
+  const supabase = supabaseAdmin;
+  const actor = await getCurrentActor();
   if (!actor?.organizationId) {
     console.error("Missing organization context for CAPA list");
     return [];
   }
 
   let query = supabase
-    .from("capa.capa_records")
-    .select(`
-      *,
-      status:ref.status_codes(id,code,name),
-      priority:ref.priority_codes(id,code,name),
-      department:core.departments(id,code,name)
-    `)
+    .schema("capa").from("capa_records")
+.select("*")
     .eq("organization_id", actor.organizationId)
     .order("created_at", { ascending: false })
     .limit(100);
@@ -337,8 +352,8 @@ export async function getCapaRecordDetails(id: string): Promise<{
     follow_up_note: string | null;
   }>;
 }> {
-  const supabase = await createSupabaseServerClient();
-  const actor = await getCurrentActor(supabase);
+  const supabase = supabaseAdmin;
+  const actor = await getCurrentActor();
   if (!actor?.organizationId) {
     return {
       record: null,
@@ -360,38 +375,38 @@ export async function getCapaRecordDetails(id: string): Promise<{
     { data: effectivenessReviewsData },
   ] = await Promise.all([
     supabase
-      .from("capa.capa_records")
+      .schema("capa").from("capa_records")
       .select("*")
       .eq("organization_id", actor.organizationId)
       .eq("id", id)
       .single(),
     supabase
-      .from("capa.capa_actions")
+      .schema("capa").from("capa_actions")
       .select("*")
       .eq("organization_id", actor.organizationId)
       .eq("capa_record_id", id)
       .order("sort_order", { ascending: true }),
     supabase
-      .from("capa.capa_comments")
+      .schema("capa").from("capa_comments")
       .select("*")
       .eq("organization_id", actor.organizationId)
       .eq("capa_record_id", id)
       .order("created_at", { ascending: true }),
     supabase
-      .from("capa.capa_status_history")
+      .schema("capa").from("capa_status_history")
       .select("old_status_id,new_status_id,changed_by_user_id,changed_at,note")
       .eq("organization_id", actor.organizationId)
       .eq("capa_record_id", id)
       .order("changed_at", { ascending: false }),
     supabase
-      .from("capa.capa_verifications")
+      .schema("capa").from("capa_verifications")
       .select(
         "id,verification_type,verification_summary,verified_by_user_id,verified_at,result,notes",
       )
       .eq("capa_record_id", id)
       .order("verified_at", { ascending: false }),
     supabase
-      .from("capa.capa_effectiveness_reviews")
+      .schema("capa").from("capa_effectiveness_reviews")
       .select(
         "id,review_due_date,reviewed_by_user_id,reviewed_at,effectiveness_result,evidence_summary,follow_up_required,follow_up_note",
       )
@@ -409,7 +424,7 @@ export async function getCapaRecordDetails(id: string): Promise<{
   const overdueEventKeys = overdueActions.map((action) => `action-overdue-${action.id}`);
   if (overdueEventKeys.length > 0) {
     const { data: existingOverdueRows } = await supabase
-      .from("core.notifications")
+      .schema("core").from("notifications")
       .select("event_key")
       .in("event_key", overdueEventKeys);
 
@@ -431,7 +446,7 @@ export async function getCapaRecordDetails(id: string): Promise<{
 
     if (notificationsToInsert.length > 0) {
       const { error: overdueInsertError } = await supabase
-        .from("core.notifications")
+        .schema("core").from("notifications")
         .insert(notificationsToInsert);
       if (overdueInsertError) {
         console.error(
@@ -455,7 +470,7 @@ export async function getCapaRecordDetails(id: string): Promise<{
 
   if (actionsIds.length > 0) {
     const { data: actionStatusHistoryData } = await supabase
-      .from("capa.capa_action_status_history")
+      .schema("capa").from("capa_action_status_history")
       .select(
         "capa_action_id,old_status_id,new_status_id,changed_by_user_id,changed_at,note",
       )
@@ -519,29 +534,33 @@ export async function createCapaRecord(input: {
   priority_id?: string;
   department_id?: string;
 }): Promise<{ ok: boolean; id?: string; error?: string }> {
-  const supabase = await createSupabaseServerClient();
-  const actor = await getCurrentActor(supabase);
+  const supabase = supabaseAdmin;
+  const actor = await getCurrentActor();
   if (!actor) return { ok: false, error: "Not authenticated" };
   if (!actor.organizationId) {
     return { ok: false, error: "Missing organization context" };
   }
 
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
-  if (!user) return { ok: false, error: "Not authenticated" };
+  const { count } = await supabase
+    .schema("capa")
+    .from("capa_records")
+    .select("*", { count: "exact", head: true });
+
+  const nextNumber = (count ?? 0) + 1;
+  const recordNo = `CAPA-${String(nextNumber).padStart(3, "0")}`;
 
   const { data, error } = await supabase
-    .from("capa.capa_records")
+    .schema("capa").from("capa_records")
     .insert({
+      record_no: recordNo,
       title: input.title,
       description: input.description ?? null,
       capa_type_id: input.capa_type_id ?? null,
       status_id: input.status_id ?? null,
       priority_id: input.priority_id ?? null,
       department_id: input.department_id ?? null,
-      owner_user_id: user.id,
-      initiator_user_id: user.id,
+      owner_user_id: String(actor.userId),
+      initiator_user_id: String(actor.userId),
       organization_id: actor.organizationId,
     })
     .select("id")
@@ -559,20 +578,15 @@ export async function addCapaComment(input: {
   capa_record_id: string;
   comment_text: string;
 }): Promise<{ ok: boolean; error?: string }> {
-  const supabase = await createSupabaseServerClient();
-  const actor = await getCurrentActor(supabase);
+  const supabase = supabaseAdmin;
+  const actor = await getCurrentActor();
   if (!actor) return { ok: false, error: "Not authenticated" };
   if (!actor.organizationId) {
     return { ok: false, error: "Missing organization context" };
   }
 
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
-  if (!user) return { ok: false, error: "Not authenticated" };
-
   const { data: scopedRecord, error: scopeError } = await supabase
-    .from("capa.capa_records")
+    .schema("capa").from("capa_records")
     .select("id")
     .eq("id", input.capa_record_id)
     .eq("organization_id", actor.organizationId)
@@ -580,10 +594,10 @@ export async function addCapaComment(input: {
   if (scopeError) return { ok: false, error: scopeError.message };
   if (!scopedRecord) return { ok: false, error: "CAPA record not found in organization" };
 
-  const { error } = await supabase.from("capa.capa_comments").insert({
+  const { error } = await supabase.schema("capa").from("capa_comments").insert({
     capa_record_id: input.capa_record_id,
     comment_text: input.comment_text,
-    created_by_user_id: user.id,
+    created_by_user_id: String(actor.userId),
     organization_id: actor.organizationId,
   });
 
@@ -604,15 +618,15 @@ export async function createCapaAction(input: {
   planned_start_date?: string;
   due_date?: string;
 }): Promise<{ ok: boolean; error?: string }> {
-  const supabase = await createSupabaseServerClient();
-  const actor = await getCurrentActor(supabase);
+  const supabase = supabaseAdmin;
+  const actor = await getCurrentActor();
   if (!actor) return { ok: false, error: "Not authenticated" };
   if (!actor.organizationId) {
     return { ok: false, error: "Missing organization context" };
   }
 
   const { data: scopedRecord, error: scopeError } = await supabase
-    .from("capa.capa_records")
+    .schema("capa").from("capa_records")
     .select("id")
     .eq("id", input.capa_record_id)
     .eq("organization_id", actor.organizationId)
@@ -621,7 +635,7 @@ export async function createCapaAction(input: {
   if (!scopedRecord) return { ok: false, error: "CAPA record not found in organization" };
 
   const { data: insertedAction, error } = await supabase
-    .from("capa.capa_actions")
+    .schema("capa").from("capa_actions")
     .insert({
       capa_record_id: input.capa_record_id,
       organization_id: actor.organizationId,
@@ -669,15 +683,15 @@ export async function updateCapaAction(
     due_date: string | null;
   }>,
 ): Promise<{ ok: boolean; error?: string }> {
-  const supabase = await createSupabaseServerClient();
-  const actor = await getCurrentActor(supabase);
+  const supabase = supabaseAdmin;
+  const actor = await getCurrentActor();
   if (!actor) return { ok: false, error: "Not authenticated" };
   if (!actor.organizationId) {
     return { ok: false, error: "Missing organization context" };
   }
 
   const { data: actionRow, error: actionReadError } = await supabase
-    .from("capa.capa_actions")
+    .schema("capa").from("capa_actions")
     .select("owner_user_id,title,organization_id")
     .eq("id", id)
     .eq("organization_id", actor.organizationId)
@@ -690,7 +704,7 @@ export async function updateCapaAction(
 
   const ownerUserId = (actionRow as { owner_user_id: string | null }).owner_user_id;
   const actionTitle = (actionRow as { title: string }).title;
-  if (!ownerUserId || ownerUserId !== actor.userId) {
+  if (!sameActorUserId(ownerUserId, actor.userId)) {
     return { ok: false, error: "Only assigned user can update action." };
   }
 
@@ -709,7 +723,7 @@ export async function updateCapaAction(
   assign("due_date");
 
   const { error } = await supabase
-    .from("capa.capa_actions")
+    .schema("capa").from("capa_actions")
     .update(payload)
     .eq("id", id);
 
@@ -739,15 +753,15 @@ export async function changeCapaActionStatus(input: {
   capa_action_id: string;
   new_status_id: string;
 }): Promise<{ ok: boolean; error?: string }> {
-  const supabase = await createSupabaseServerClient();
-  const actor = await getCurrentActor(supabase);
+  const supabase = supabaseAdmin;
+  const actor = await getCurrentActor();
   if (!actor) return { ok: false, error: "Not authenticated" };
   if (!actor.organizationId) {
     return { ok: false, error: "Missing organization context" };
   }
 
   const { data: action, error: fetchError } = await supabase
-    .from("capa.capa_actions")
+    .schema("capa").from("capa_actions")
     .select("status_id,capa_record_id,owner_user_id,organization_id")
     .eq("id", input.capa_action_id)
     .eq("organization_id", actor.organizationId)
@@ -767,7 +781,7 @@ export async function changeCapaActionStatus(input: {
   const capaRecordId = typedAction.capa_record_id;
   const actionOwnerUserId = typedAction.owner_user_id;
 
-  if (!actionOwnerUserId || actionOwnerUserId !== actor.userId) {
+  if (!sameActorUserId(actionOwnerUserId, actor.userId)) {
     return { ok: false, error: "Only assigned user can update action status." };
   }
 
@@ -776,7 +790,7 @@ export async function changeCapaActionStatus(input: {
   }
 
   const { data: statusRows, error: statusError } = await supabase
-    .from("ref.status_codes")
+    .schema("ref").from("status_codes")
     .select("id,code,is_final")
     .in("id", [oldStatusId, input.new_status_id]);
 
@@ -827,7 +841,7 @@ export async function changeCapaActionStatus(input: {
   }
 
   const { error: updateError } = await supabase
-    .from("capa.capa_actions")
+    .schema("capa").from("capa_actions")
     .update({ status_id: input.new_status_id })
     .eq("id", input.capa_action_id)
     .eq("organization_id", actor.organizationId);
@@ -838,12 +852,12 @@ export async function changeCapaActionStatus(input: {
   }
 
   const { error: historyError } = await supabase
-    .from("capa.capa_action_status_history")
+    .schema("capa").from("capa_action_status_history")
     .insert({
       capa_action_id: input.capa_action_id,
       old_status_id: oldStatusId,
       new_status_id: input.new_status_id,
-      changed_by_user_id: actor.userId,
+      changed_by_user_id: String(actor.userId),
       organization_id: actor.organizationId,
     });
 
@@ -865,7 +879,7 @@ export async function changeCapaActionStatus(input: {
   }
 
   const { data: allActionStatusesData, error: allActionsError } = await supabase
-    .from("capa.capa_actions")
+    .schema("capa").from("capa_actions")
     .select("status_id")
     .eq("organization_id", actor.organizationId)
     .eq("capa_record_id", capaRecordId);
@@ -888,7 +902,7 @@ export async function changeCapaActionStatus(input: {
 
   const uniqueActionStatusIds = Array.from(new Set(allActionStatusIds));
   const { data: actionStatusRows, error: actionStatusCodesError } = await supabase
-    .from("ref.status_codes")
+    .schema("ref").from("status_codes")
     .select("id,code")
     .in("id", uniqueActionStatusIds);
 
@@ -929,7 +943,7 @@ export async function changeCapaActionStatus(input: {
   }
 
   const { data: capaRecordData, error: capaRecordError } = await supabase
-    .from("capa.capa_records")
+    .schema("capa").from("capa_records")
     .select("status_id")
     .eq("organization_id", actor.organizationId)
     .eq("id", capaRecordId)
@@ -944,12 +958,12 @@ export async function changeCapaActionStatus(input: {
 
   const [capaCurrentStatusResult, capaTargetStatusResult] = await Promise.all([
     supabase
-      .from("ref.status_codes")
+      .schema("ref").from("status_codes")
       .select("id,code,is_final")
       .eq("id", capaCurrentStatusId)
       .single(),
     supabase
-      .from("ref.status_codes")
+      .schema("ref").from("status_codes")
       .select("id,code,is_final")
       .eq("code", targetCapaStatusCode)
       .single(),
@@ -990,7 +1004,7 @@ export async function changeCapaActionStatus(input: {
   }
 
   const { error: capaUpdateError } = await supabase
-    .from("capa.capa_records")
+    .schema("capa").from("capa_records")
     .update({ status_id: targetCapaStatus.id })
     .eq("id", capaRecordId)
     .eq("organization_id", actor.organizationId);
@@ -1001,12 +1015,12 @@ export async function changeCapaActionStatus(input: {
   }
 
   const { error: capaHistoryError } = await supabase
-    .from("capa.capa_status_history")
+    .schema("capa").from("capa_status_history")
     .insert({
       capa_record_id: capaRecordId,
       old_status_id: currentCapaStatus.id,
       new_status_id: targetCapaStatus.id,
-      changed_by_user_id: actor.userId,
+      changed_by_user_id: String(actor.userId),
       organization_id: actor.organizationId,
       note: `Auto-transitioned from actions: all actions ${allVerified ? "VERIFIED" : "COMPLETED"}.`,
     });
@@ -1044,15 +1058,15 @@ export async function updateCapaRecord(
     closed_at: string | null;
   }>,
 ): Promise<{ ok: boolean; error?: string }> {
-  const supabase = await createSupabaseServerClient();
-  const actor = await getCurrentActor(supabase);
+  const supabase = supabaseAdmin;
+  const actor = await getCurrentActor();
   if (!actor) return { ok: false, error: "Not authenticated" };
   if (!actor.organizationId) {
     return { ok: false, error: "Missing organization context" };
   }
 
   const { data: capaRow, error: capaReadError } = await supabase
-    .from("capa.capa_records")
+    .schema("capa").from("capa_records")
     .select("owner_user_id,closed_at,organization_id")
     .eq("id", id)
     .eq("organization_id", actor.organizationId)
@@ -1066,7 +1080,9 @@ export async function updateCapaRecord(
   const ownerUserId = (capaRow as { owner_user_id: string | null }).owner_user_id;
   const existingClosedAt = (capaRow as { closed_at: string | null }).closed_at;
   const isQualityManager = actor.roleCodes.includes("QUALITY_MANAGER");
-  const canEdit = isQualityManager || (ownerUserId !== null && ownerUserId === actor.userId);
+  const canEdit =
+    isQualityManager ||
+    (ownerUserId !== null && sameActorUserId(ownerUserId, actor.userId));
 
   if (!canEdit) {
     return {
@@ -1108,7 +1124,7 @@ export async function updateCapaRecord(
   assign("closed_at");
 
   const { error } = await supabase
-    .from("capa.capa_records")
+    .schema("capa").from("capa_records")
     .update(payload)
     .eq("id", id)
     .eq("organization_id", actor.organizationId);

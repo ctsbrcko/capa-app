@@ -34,7 +34,8 @@ export function NotificationsRealtime({
 
     const refreshUnreadCount = async () => {
       const { count } = await supabase
-        .from("core.notifications")
+        .schema("core")
+        .from("notifications")
         .select("*", { count: "exact", head: true })
         .eq("user_id", userId)
         .eq("is_read", false);

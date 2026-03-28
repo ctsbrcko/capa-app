@@ -11,17 +11,34 @@ export type NotificationItem = {
   created_at: string;
 };
 
+async function getCurrentDbUserId(supabase: any): Promise<number | null> {
+  const {
+    data: { user: authUser },
+  } = await supabase.auth.getUser();
+
+  if (!authUser) return null;
+
+  const { data: dbUser } = await supabase
+    .schema("core")
+    .from("users")
+    .select("id")
+    .eq("auth_user_id", authUser.id)
+    .single();
+
+  return dbUser?.id ?? null;
+}
+
 export async function listMyNotifications(limit = 50): Promise<NotificationItem[]> {
   const supabase = await createSupabaseServerClient();
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
-  if (!user) return [];
+
+  const dbUserId = await getCurrentDbUserId(supabase);
+  if (!dbUserId) return [];
 
   const { data, error } = await supabase
-    .from("core.notifications")
+    .schema("core")
+    .from("notifications")
     .select("*")
-    .eq("user_id", user.id)
+    .eq("user_id", dbUserId)
     .order("created_at", { ascending: false })
     .limit(limit);
 
@@ -35,15 +52,15 @@ export async function listMyNotifications(limit = 50): Promise<NotificationItem[
 
 export async function getMyUnreadNotificationsCount(): Promise<number> {
   const supabase = await createSupabaseServerClient();
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
-  if (!user) return 0;
+
+  const dbUserId = await getCurrentDbUserId(supabase);
+  if (!dbUserId) return 0;
 
   const { count, error } = await supabase
-    .from("core.notifications")
+    .schema("core")
+    .from("notifications")
     .select("*", { count: "exact", head: true })
-    .eq("user_id", user.id)
+    .eq("user_id", dbUserId)
     .eq("is_read", false);
 
   if (error) {
@@ -56,29 +73,28 @@ export async function getMyUnreadNotificationsCount(): Promise<number> {
 
 export async function markNotificationAsRead(id: string): Promise<void> {
   const supabase = await createSupabaseServerClient();
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
-  if (!user) return;
+
+  const dbUserId = await getCurrentDbUserId(supabase);
+  if (!dbUserId) return;
 
   await supabase
-    .from("core.notifications")
+    .schema("core")
+    .from("notifications")
     .update({ is_read: true })
     .eq("id", id)
-    .eq("user_id", user.id);
+    .eq("user_id", dbUserId);
 }
 
 export async function markAllNotificationsAsRead(): Promise<void> {
   const supabase = await createSupabaseServerClient();
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
-  if (!user) return;
+
+  const dbUserId = await getCurrentDbUserId(supabase);
+  if (!dbUserId) return;
 
   await supabase
-    .from("core.notifications")
+    .schema("core")
+    .from("notifications")
     .update({ is_read: true })
-    .eq("user_id", user.id)
+    .eq("user_id", dbUserId)
     .eq("is_read", false);
 }
-
